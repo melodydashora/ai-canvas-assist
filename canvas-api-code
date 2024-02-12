@@ -1,0 +1,205 @@
+from canvasapi import Canvas
+import re
+from datetime import datetime, timedelta
+import pytz
+from bs4 import BeautifulSoup
+import textwrap
+
+# Configuration for Canvas API
+API_URL = ''
+API_KEY = ''
+
+# Initialize a new Canvas object
+canvas = Canvas(API_URL, API_KEY)
+
+
+# Utility Functions
+def clean_name(name):
+    return ' - '.join(part.strip() for part in name.split('-')).strip()
+
+
+def extract_percentage(grade):
+    if isinstance(grade, str) and '%' in grade:
+        match = re.search(r"(\d+\.?\d*)%", grade)
+        return match.group(1) if match else None
+    return None
+
+
+def calculate_final_percentage(score, points_possible):
+    try:
+        percentage = extract_percentage(score)
+        if percentage:
+            return float(percentage)
+        return round((float(score) / float(points_possible)) * 100, 2) if points_possible else None
+    except Exception as e:
+        print(f"Error calculating final percentage: {e}")
+        return None
+
+
+def is_due_date_recent(due_at, days=14):
+    if due_at:
+        due_date = datetime.strptime(due_at, "%Y-%m-%dT%H:%M:%SZ")
+        return datetime.now(pytz.utc) - due_date <= timedelta(days=days)
+    return False
+
+
+def adjust_due_date_to_timezone(due_at, timezone='UTC'):
+    if due_at:
+        utc_due_date = datetime.strptime(due_at, "%Y-%m-%dT%H:%M:%SZ")
+        local_due_date = utc_due_date.replace(tzinfo=pytz.utc).astimezone(pytz.timezone(timezone))
+        return local_due_date.strftime("%Y-%m-%d %H:%M:%S")
+    return "No due date"
+
+
+def clean_html(html_content):
+    if html_content:
+        soup = BeautifulSoup(html_content, "html.parser")
+        return ' '.join(soup.get_text(separator=" ").split())
+    return "No description available"
+
+
+def get_latest_submission_date(module, user, course):
+    latest_date = None
+    items = module.get_module_items()
+    for item in items:
+        if getattr(item, 'type', '') == 'Assignment':
+            # Corrected to use the course object passed as an argument
+            assignment = course.get_assignment(item.content_id)
+            submission = assignment.get_submission(user)
+            if submission.submitted_at:
+                submitted_at = datetime.strptime(submission.submitted_at, "%Y-%m-%dT%H:%M:%SZ")
+                if not latest_date or submitted_at > latest_date:
+                    latest_date = submitted_at
+    return latest_date
+
+
+class ModuleHandler:
+    def __init__(self, course, canvas):
+        self.course = course
+        self.canvas = canvas
+
+    def display_module_info(self):
+        modules = self.course.get_modules()
+        current_date = datetime.now(pytz.utc)
+        for module in modules:
+            completed_at = getattr(module, 'completed_at', None)
+            if completed_at:
+                completed_date = datetime.strptime(completed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.utc)
+                # Skip the module if completed more than 7 days ago
+                if (current_date - completed_date).days > 7:
+                    continue
+
+            self._print_module_details(module)
+
+    def _print_module_details(self, module):
+        module_name = clean_name(module.name)
+        module_url = module.html_url if hasattr(module, 'html_url') else "No URL available"
+        print(f"\tModule: {module_name}, URL: {module_url}")
+        self._print_module_items(module)
+
+    def _print_module_items(self, module):
+        user = self.canvas.get_current_user()
+        items = module.get_module_items()
+        for item in items:
+            item_title = clean_name(item.title)
+            item_type = getattr(item, 'type', 'No Type')
+            item_url = getattr(item, 'html_url', "No URL available").strip()
+            due_at_local = adjust_due_date_to_timezone(getattr(item, 'due_at', None))
+
+            item_description = "No description available"
+            to_do_marker, submission_status, grade, final_percentage = self.process_submission(item, user, item_type)
+
+            if item_type in ['Assignment', 'Quiz']:
+                content_object = getattr(self, f"_get_{item_type.lower()}_details")(item.content_id)
+                html_description = getattr(content_object, 'description', item_description)
+                item_description = clean_html(html_description)
+
+            wrapped_description = textwrap.fill(item_description, width=80)
+
+            print(
+                f"\t\tItem ({item_type}{to_do_marker}): {item_title}, Description: {wrapped_description}, Link: {item_url}, Due Date: {due_at_local}, Submission Status: {submission_status}, Grade: {grade}, Final Percentage: {final_percentage}")
+
+    def _print_module_items(self, module):
+        user = self.canvas.get_current_user()
+        items = module.get_module_items()
+        for item in items:
+            item_title = clean_name(item.title)
+            item_type = getattr(item, 'type', 'No Type')
+            item_url = getattr(item, 'html_url', "No URL available").strip()
+            item_description = "No description available"
+            to_do_marker, submission_status, grade, final_percentage, due_at_local = self.process_submission(item, user,
+                                                                                                             item_type)
+
+            if item_type == 'Assignment' or item_type == 'Quiz':
+                content_object = getattr(self, f"_get_{item_type.lower()}_details")(item.content_id)
+                html_description = getattr(content_object, 'description', item_description)
+                item_description = clean_html(html_description)
+
+            wrapped_description = textwrap.fill(item_description, width=80)
+
+            print(
+                f"\t\tItem ({item_type}{to_do_marker}): {item_title}, Description: {wrapped_description}, Link: {item_url}, Due Date: {due_at_local}, Submission Status: {submission_status}, Grade: {grade}, Final Percentage: {final_percentage}")
+
+    def _get_assignment_details(self, assignment_id):
+        return self.course.get_assignment(assignment_id)
+
+    def _get_quiz_details(self, quiz_id):
+        return self.course.get_quiz(quiz_id)
+
+    def process_submission(self, item, user, item_type):
+        to_do_marker = ""
+        submission_status = "N/A"
+        grade = "N/A"
+        final_percentage = "N/A"
+        due_at_local = "No due date"
+
+        if item_type == 'Assignment':
+            content_object = self.course.get_assignment(item.content_id)
+        elif item_type == 'Quiz':
+            content_object = self.course.get_quiz(item.content_id)
+        else:
+            content_object = None
+
+        if content_object:
+            submission = None
+            if hasattr(content_object, 'get_submission'):
+                submission = content_object.get_submission(user)
+            elif hasattr(content_object, 'get_submissions'):
+                submissions = content_object.get_submissions()
+                submission = next((sub for sub in submissions if sub.user_id == user.id), None)
+
+            if submission:
+                if submission.workflow_state in ['unsubmitted', 'pending_review']:
+                    to_do_marker = " [TO-DO]"
+                submission_status = getattr(submission, 'workflow_state', "No status").strip()
+                grade = getattr(submission, 'grade', None) or getattr(submission, 'score', None)
+                final_percentage = calculate_final_percentage(grade, getattr(content_object, 'points_possible', 0))
+
+            if hasattr(content_object, 'due_at'):
+                due_at_local = adjust_due_date_to_timezone(content_object.due_at)
+
+        return to_do_marker, submission_status, grade, final_percentage, due_at_local
+
+
+class CourseHandler:
+    def __init__(self, canvas):
+        self.canvas = canvas
+
+    def _print_course_info(self, course):
+        course_name = clean_name(getattr(course, 'name', "Unnamed Course"))
+        print(f"Course ID: {course.id}, Course Name: {course_name}")
+        module_handler = ModuleHandler(course, self.canvas)
+        module_handler.display_module_info()
+
+    def get_courses_excluding_class_of(self):
+        user = self.canvas.get_current_user()
+        courses = user.get_courses(enrollment_state='active')
+        for course in courses:
+            if "Class of" not in getattr(course, 'name', ""):
+                self._print_course_info(course)
+
+
+# Main execution
+if __name__ == "__main__":
+    course_handler = CourseHandler(canvas)
+    course_handler.get_courses_excluding_class_of()
